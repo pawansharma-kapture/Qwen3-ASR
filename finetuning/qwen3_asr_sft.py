@@ -116,14 +116,25 @@ class DataCollatorForQwen3ASRFinetuning:
     processor: Any
     sampling_rate: int = 16000
 
+    def _resolve_audio(self, audio_field):
+        """Handle audio from file paths (JSONL) or HF Audio dicts."""
+        if isinstance(audio_field, dict):
+            # HF datasets Audio feature: {"path": ..., "array": np.ndarray, "sampling_rate": int}
+            arr = audio_field["array"]
+            sr = audio_field.get("sampling_rate", self.sampling_rate)
+            if sr != self.sampling_rate:
+                arr = librosa.resample(arr, orig_sr=sr, target_sr=self.sampling_rate)
+            return arr
+        # File path string
+        return load_audio(audio_field, sr=self.sampling_rate)
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        audio_paths = [f["audio"] for f in features]
         prefix_texts = [f["prefix_text"] for f in features]
         targets = [f["target"] for f in features]
 
         eos = self.processor.tokenizer.eos_token or ""
         full_texts = [pfx + tgt + eos for pfx, tgt in zip(prefix_texts, targets)]
-        audios = [load_audio(p, sr=self.sampling_rate) for p in audio_paths]
+        audios = [self._resolve_audio(f["audio"]) for f in features]
 
         full_inputs = self.processor(
             text=full_texts,
@@ -205,9 +216,23 @@ def parse_args():
 
     # Paths
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
-    p.add_argument("--train_file", type=str, default="train.jsonl")
+    p.add_argument("--train_file", type=str, default="")
     p.add_argument("--eval_file", type=str, default="")
     p.add_argument("--output_dir", type=str, default="./qwen3-asr-finetuning-out")
+
+    # HF Hub dataset
+    p.add_argument("--dataset_name", type=str, default="",
+                    help="HF Hub dataset name (e.g. 'username/my-asr-dataset'). "
+                         "Expects 'audio' and 'text' columns.")
+    p.add_argument("--dataset_config", type=str, default=None,
+                    help="Dataset config/subset name")
+    p.add_argument("--dataset_train_split", type=str, default="train",
+                    help="Name of the training split")
+    p.add_argument("--dataset_eval_split", type=str, default="",
+                    help="Name of the evaluation split (e.g. 'test', 'validation')")
+    p.add_argument("--streaming", action="store_true",
+                    help="Stream the HF dataset instead of downloading it fully. "
+                         "Requires --max_steps to be set.")
 
     # Audio
     p.add_argument("--sr", type=int, default=16000)
@@ -217,6 +242,8 @@ def parse_args():
     p.add_argument("--grad_acc", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--epochs", type=float, default=1)
+    p.add_argument("--max_steps", type=int, default=-1,
+                    help="Max training steps. Required for --streaming mode.")
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--lr_scheduler_type", type=str, default="linear")
     p.add_argument("--warmup_ratio", type=float, default=0.02)
@@ -242,8 +269,11 @@ def parse_args():
 def main():
     args_cli = parse_args()
 
-    if not args_cli.train_file:
-        raise ValueError("TRAIN_FILE is required (json/jsonl). Needs fields: audio, text, optional prompt")
+    if not args_cli.train_file and not args_cli.dataset_name:
+        raise ValueError(
+            "Either --train_file (json/jsonl) or --dataset_name (HF Hub) is required. "
+            "Dataset needs 'audio' and 'text' columns."
+        )
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
@@ -257,20 +287,52 @@ def main():
     patch_outer_forward(model)
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
-    raw_ds = load_dataset(
-        "json",
-        data_files={
-            "train": args_cli.train_file,
-            **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
-        },
-    )
-    ds = raw_ds.map(make_preprocess_fn_prefix_only(processor), num_proc=1)
+    streaming = args_cli.streaming and bool(args_cli.dataset_name)
+    if streaming and args_cli.max_steps <= 0:
+        raise ValueError("--max_steps is required when using --streaming mode.")
 
-    keep = {"prompt", "audio", "target", "prefix_text"}
-    for split in ds.keys():
-        drop = [c for c in ds[split].column_names if c not in keep]
-        if drop:
-            ds[split] = ds[split].remove_columns(drop)
+    preprocess_fn = make_preprocess_fn_prefix_only(processor)
+    keep_cols = {"prompt", "audio", "target", "prefix_text"}
+
+    def _map_and_prune(dataset, is_streaming: bool):
+        """Apply preprocessing and drop extra columns."""
+        mapped = dataset.map(preprocess_fn) if is_streaming else dataset.map(preprocess_fn, num_proc=1)
+        col_names = mapped.column_names
+        if col_names:
+            drop = [c for c in col_names if c not in keep_cols]
+            if drop:
+                mapped = mapped.remove_columns(drop)
+        return mapped
+
+    if args_cli.dataset_name:
+        # ---------- HF Hub dataset ----------
+        from datasets import Audio
+
+        hub_ds = load_dataset(
+            args_cli.dataset_name,
+            args_cli.dataset_config,
+            streaming=streaming,
+            trust_remote_code=True,
+        )
+
+        # Cast audio column to Audio feature at the target sampling rate
+        hub_ds = hub_ds.cast_column("audio", Audio(sampling_rate=args_cli.sr))
+
+        train_ds = _map_and_prune(hub_ds[args_cli.dataset_train_split], streaming)
+        eval_ds = None
+        if args_cli.dataset_eval_split and args_cli.dataset_eval_split in hub_ds:
+            eval_ds = _map_and_prune(hub_ds[args_cli.dataset_eval_split], streaming)
+    else:
+        # ---------- Local JSONL files ----------
+        raw_ds = load_dataset(
+            "json",
+            data_files={
+                "train": args_cli.train_file,
+                **({"validation": args_cli.eval_file} if args_cli.eval_file else {}),
+            },
+        )
+        train_ds = _map_and_prune(raw_ds["train"], False)
+        eval_ds = _map_and_prune(raw_ds["validation"], False) if "validation" in raw_ds else None
 
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
 
@@ -280,6 +342,7 @@ def main():
         gradient_accumulation_steps=args_cli.grad_acc,
         learning_rate=args_cli.lr,
         num_train_epochs=args_cli.epochs,
+        max_steps=args_cli.max_steps,
         logging_steps=args_cli.log_steps,
         lr_scheduler_type=args_cli.lr_scheduler_type,
         warmup_ratio=args_cli.warmup_ratio,
@@ -293,7 +356,7 @@ def main():
         save_safetensors=True,
         eval_strategy="steps",
         eval_steps=args_cli.save_steps,
-        do_eval=bool(args_cli.eval_file),
+        do_eval=(eval_ds is not None),
         bf16=use_bf16,
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
@@ -304,8 +367,8 @@ def main():
     trainer = CastFloatInputsTrainer(
         model=model,
         args=training_args,
-        train_dataset=ds["train"],
-        eval_dataset=ds.get("validation", None),
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
         data_collator=collator,
         tokenizer=processor.tokenizer,
         callbacks=[MakeEveryCheckpointInferableCallback(base_model_path=args_cli.model_path)],
