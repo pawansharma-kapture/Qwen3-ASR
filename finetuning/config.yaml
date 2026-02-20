@@ -6,22 +6,22 @@
 
 # --------------- Model ---------------
 model_path: Qwen/Qwen3-ASR-1.7B
-output_dir: ./qwen3-asr-finetuning-out
+output_dir: ./qwen3-asr-finetuning-Hindi
 
 # --------------- Data source (choose one) ---------------
 
 # Option A: local JSONL files
-train_file: ""
-eval_file: ""
+# train_file: ""
+# eval_file: ""
 
 # Option B: HF Hub dataset
-# dataset_name: username/my-asr-dataset
-# dataset_config: null          # subset/config name, if any
+dataset_name: Kapture/Hindi-Transcription-DS
+dataset_config: null          # subset/config name, if any
 # dataset_train_split: train
 # dataset_eval_split: test
-# streaming: false              # set to true for large datasets (requires max_steps)
-# language: English             # prepend "language LANG<asr_text>" to plain transcripts
-                                # omit if your text already has the prefix
+streaming: false              # set to true for large datasets (requires max_steps)
+language: Hindi             # prepend "language LANG<asr_text>" to plain transcripts
+#                                # omit if your text already has the prefix
 
 # --------------- Audio ---------------
 sr: 16000
@@ -30,27 +30,27 @@ sr: 16000
 batch_size: 8
 grad_acc: 4
 lr: 2.0e-5
-epochs: 1
-max_steps: -1                   # required when streaming: true
+epochs: 2
+max_steps: 60                   # required when streaming: true
 log_steps: 10
-lr_scheduler_type: linear
+lr_scheduler_type: cosine
 warmup_ratio: 0.02
 
 # --------------- DataLoader ---------------
-num_workers: 4
+num_workers: 8
 pin_memory: 1
 persistent_workers: 1
 prefetch_factor: 2
 
 # --------------- Checkpointing ---------------
 save_strategy: steps
-save_steps: 200
+save_steps: 10
 save_total_limit: 5
 
 # --------------- Eval split from training data ---------------
-eval_split_ratio: 0.0           # e.g. 0.05 to hold out 5% of train as eval
-                                # ignored if an eval source is already provided
-                                # not compatible with streaming
+eval_split_ratio: 0.006           # e.g. 0.05 to hold out 5% of train as eval
+#                                # ignored if an eval source is already provided
+#                                # not compatible with streaming
 eval_split_seed: 42
 
 # --------------- Resume ---------------
@@ -58,5 +58,5 @@ resume: 0                       # set to 1 to auto-resume from latest checkpoint
 resume_from: ""                 # explicit checkpoint path
 
 # --------------- Logging ---------------
-wandb_project: ""               # set to enable W&B logging, e.g. "my-asr-project"
-wandb_run_name: ""              # optional run name in W&B
+wandb_project: "Qwen3-ASR-Finetune"               # set to enable W&B logging, e.g. "my-asr-project"
+wandb_run_name: "TrialRun"              # optional run name in W&B
