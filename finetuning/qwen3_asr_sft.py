@@ -342,7 +342,7 @@ def main():
 
     def _map_and_prune(dataset, is_streaming: bool):
         """Apply preprocessing and drop extra columns."""
-        mapped = dataset.map(preprocess_fn) if is_streaming else dataset.map(preprocess_fn, num_proc=1)
+        mapped = dataset.map(preprocess_fn) if is_streaming else dataset.map(preprocess_fn, num_proc=8)
         col_names = mapped.column_names
         if col_names:
             drop = [c for c in col_names if c not in keep_cols]
