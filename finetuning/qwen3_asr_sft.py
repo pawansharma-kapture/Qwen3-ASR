@@ -20,6 +20,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 import librosa
 import torch
 from datasets import load_dataset
@@ -93,7 +95,9 @@ def build_prefix_messages(prompt: str, audio_array):
     ]
 
 
-def make_preprocess_fn_prefix_only(processor):
+def make_preprocess_fn_prefix_only(processor, language: Optional[str] = None):
+    lang_prefix = f"language {language}<asr_text>" if language else ""
+
     def _preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
         prompt = ex.get("prompt", "")
         dummy_audio = None
@@ -104,7 +108,7 @@ def make_preprocess_fn_prefix_only(processor):
         return {
             "prompt": prompt,
             "audio": ex["audio"],
-            "target": ex["text"],
+            "target": lang_prefix + ex["text"],
             "prefix_text": prefix_text,
         }
 
@@ -212,7 +216,20 @@ class MakeEveryCheckpointInferableCallback(TrainerCallback):
 
 
 def parse_args():
+    # ---- pre-pass: extract --config before the full parse ----
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default="")
+    pre_args, _ = pre.parse_known_args()
+
+    yaml_defaults: Dict[str, Any] = {}
+    if pre_args.config:
+        with open(pre_args.config) as f:
+            yaml_defaults = yaml.safe_load(f) or {}
+
+    # ---- full parser ----
     p = argparse.ArgumentParser("Qwen3-ASR Finetuning")
+    p.add_argument("--config", type=str, default="",
+                    help="Path to a YAML config file. CLI args override YAML values.")
 
     # Paths
     p.add_argument("--model_path", type=str, default="Qwen/Qwen3-ASR-1.7B")
@@ -233,6 +250,10 @@ def parse_args():
     p.add_argument("--streaming", action="store_true",
                     help="Stream the HF dataset instead of downloading it fully. "
                          "Requires --max_steps to be set.")
+    p.add_argument("--language", type=str, default=None,
+                    help="Prepend 'language LANG<asr_text>' to every transcript. "
+                         "Use when your dataset has plain text without this prefix "
+                         "(e.g. --language English, --language Chinese, --language None).")
 
     # Audio
     p.add_argument("--sr", type=int, default=16000)
@@ -259,9 +280,26 @@ def parse_args():
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--save_total_limit", type=int, default=5)
 
+    # Eval split from training data
+    p.add_argument("--eval_split_ratio", type=float, default=0.0,
+                    help="Fraction of the training set to use as eval (e.g. 0.05 for 5%%). "
+                         "Used when no eval source is provided. Not compatible with --streaming.")
+    p.add_argument("--eval_split_seed", type=int, default=42,
+                    help="Random seed for the train/eval split.")
+
     # Resume
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
+
+    # Logging
+    p.add_argument("--wandb_project", type=str, default="",
+                    help="Weights & Biases project name. Enables wandb logging when set.")
+    p.add_argument("--wandb_run_name", type=str, default="",
+                    help="Weights & Biases run name.")
+
+    # Apply YAML as defaults (CLI args override these)
+    if yaml_defaults:
+        p.set_defaults(**yaml_defaults)
 
     return p.parse_args()
 
@@ -274,6 +312,14 @@ def main():
             "Either --train_file (json/jsonl) or --dataset_name (HF Hub) is required. "
             "Dataset needs 'audio' and 'text' columns."
         )
+
+    # ---- Weights & Biases ----
+    report_to = "none"
+    if args_cli.wandb_project:
+        os.environ["WANDB_PROJECT"] = args_cli.wandb_project
+        if args_cli.wandb_run_name:
+            os.environ["WANDB_RUN_NAME"] = args_cli.wandb_run_name
+        report_to = "wandb"
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     asr_wrapper = Qwen3ASRModel.from_pretrained(
@@ -291,7 +337,7 @@ def main():
     if streaming and args_cli.max_steps <= 0:
         raise ValueError("--max_steps is required when using --streaming mode.")
 
-    preprocess_fn = make_preprocess_fn_prefix_only(processor)
+    preprocess_fn = make_preprocess_fn_prefix_only(processor, language=args_cli.language)
     keep_cols = {"prompt", "audio", "target", "prefix_text"}
 
     def _map_and_prune(dataset, is_streaming: bool):
@@ -334,6 +380,20 @@ def main():
         train_ds = _map_and_prune(raw_ds["train"], False)
         eval_ds = _map_and_prune(raw_ds["validation"], False) if "validation" in raw_ds else None
 
+    # ---- Auto eval split from training data ----
+    if eval_ds is None and args_cli.eval_split_ratio > 0:
+        if streaming:
+            raise ValueError(
+                "--eval_split_ratio is not compatible with --streaming. "
+                "Use --dataset_eval_split to specify a separate eval split instead."
+            )
+        split = train_ds.train_test_split(
+            test_size=args_cli.eval_split_ratio,
+            seed=args_cli.eval_split_seed,
+        )
+        train_ds = split["train"]
+        eval_ds = split["test"]
+
     collator = DataCollatorForQwen3ASRFinetuning(processor=processor, sampling_rate=args_cli.sr)
 
     training_args = TrainingArguments(
@@ -361,7 +421,7 @@ def main():
         fp16=not use_bf16,
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
-        report_to="none",
+        report_to=report_to,
     )
 
     trainer = CastFloatInputsTrainer(
