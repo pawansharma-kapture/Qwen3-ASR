@@ -121,11 +121,23 @@ class DataCollatorForQwen3ASRFinetuning:
     sampling_rate: int = 16000
 
     def _resolve_audio(self, audio_field):
-        """Handle audio from file paths (JSONL) or HF Audio dicts."""
+        """Handle audio from file paths (JSONL), HF Audio dicts, or AudioDecoder objects."""
         if isinstance(audio_field, dict):
-            # HF datasets Audio feature: {"path": ..., "array": np.ndarray, "sampling_rate": int}
+            # HF datasets Audio feature (soundfile/librosa backend):
+            # {"path": ..., "array": np.ndarray, "sampling_rate": int}
             arr = audio_field["array"]
             sr = audio_field.get("sampling_rate", self.sampling_rate)
+            if sr != self.sampling_rate:
+                arr = librosa.resample(arr, orig_sr=sr, target_sr=self.sampling_rate)
+            return arr
+        if hasattr(audio_field, "get_all_samples"):
+            # datasets >= 3.x with torchcodec backend returns a lazy AudioDecoder.
+            # get_all_samples() → AudioSamples with .data (channels, samples) and .sample_rate
+            samples = audio_field.get_all_samples()
+            arr = samples.data.numpy()
+            if arr.ndim == 2:
+                arr = arr.mean(axis=0)  # (channels, samples) → mono
+            sr = int(samples.sample_rate)
             if sr != self.sampling_rate:
                 arr = librosa.resample(arr, orig_sr=sr, target_sr=self.sampling_rate)
             return arr
