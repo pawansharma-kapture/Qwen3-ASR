@@ -370,7 +370,6 @@ def main():
             args_cli.dataset_name,
             args_cli.dataset_config,
             streaming=streaming,
-            trust_remote_code=True,
         )
 
         # Cast audio column to Audio feature at the target sampling rate
@@ -434,6 +433,12 @@ def main():
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
         report_to=report_to,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        push_to_hub=True,
+        hub_model_id="Kapture/hinden-ASR-1_7B-vaani",
+        hub_strategy="every_save",
     )
 
     trainer = CastFloatInputsTrainer(
